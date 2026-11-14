@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""omacctv-talk-relay: two-way audio for OmaCCTV, without camera passwords on the phone.
+
+Runs next to Frigate (any Linux box on the LAN, Python 3 standard library only). The phone connects over TCP, sends one line
+"TALK <camera>\n" and then raw G.711 mu-law audio (8 kHz mono). The relay forwards it
+  - to a Reolink camera over its ONVIF RTSP backchannel (PCMU sendonly track), or
+  - to this machine's own speaker (aplay) for the camera named in TALK_LOCAL, e.g. a USB
+    webcam plugged into the Frigate box.
+Camera RTSP URLs (with passwords) come from the environment (TALK_URL_<name>), so they
+never leave this machine. One talker per camera at a time.
+"""
+import hashlib, os, random, re, socket, struct, subprocess, sys, threading, time, urllib.parse
+
+PORT = int(os.environ.get("TALK_PORT", "8557"))
+LOCAL = os.environ.get("TALK_LOCAL", "")  # camera whose talk goes to this machine's own speaker (aplay)
+ALSA = os.environ.get("TALK_ALSA", "default")
+busy = set()
+lock = threading.Lock()
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+class Rtsp:
+    def __init__(self, url):
+        m = re.match(r"rtsp://([^:@/]+):(.*)@([^:/]+)(?::(\d+))?(/.*)", url)
+        if not m:
+            raise ValueError("bad url")
+        self.user, self.pw = urllib.parse.unquote(m[1]), urllib.parse.unquote(m[2])
+        self.host, self.port, self.path = m[3], int(m[4] or 554), m[5]
+        self.base = f"rtsp://{self.host}:{self.port}{self.path}"
+        self.s = socket.create_connection((self.host, self.port), 6)
+        self.cseq, self.realm, self.nonce, self.session = 1, None, None, None
+        self.buf = b""
+
+    def _auth(self, method, uri):
+        if not self.nonce:
+            return ""
+        ha1 = hashlib.md5(f"{self.user}:{self.realm}:{self.pw}".encode()).hexdigest()
+        ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
+        r = hashlib.md5(f"{ha1}:{self.nonce}:{ha2}".encode()).hexdigest()
+        return f'Authorization: Digest username="{self.user}", realm="{self.realm}", nonce="{self.nonce}", uri="{uri}", response="{r}"\r\n'
+
+    def _read(self):
+        while b"\r\n\r\n" not in self.buf:
+            c = self.s.recv(65536)
+            if not c:
+                raise EOFError("rtsp closed")
+            self.buf += c
+            # Skip interleaved RTP/RTCP the camera might send.
+            while self.buf[:1] == b"$" and len(self.buf) >= 4:
+                n = struct.unpack(">H", self.buf[2:4])[0]
+                if len(self.buf) < 4 + n:
+                    break
+                self.buf = self.buf[4 + n:]
+        head, self.buf = self.buf.split(b"\r\n\r\n", 1)
+        head = head.decode(errors="replace")
+        m = re.search(r"Content-Length:\s*(\d+)", head, re.I)
+        n = int(m[1]) if m else 0
+        while len(self.buf) < n:
+            self.buf += self.s.recv(65536)
+        body, self.buf = self.buf[:n].decode(errors="replace"), self.buf[n:]
+        return head, body
+
+    def req(self, method, uri, extra=""):
+        for _ in range(2):
+            self.cseq += 1
+            sess = f"Session: {self.session}\r\n" if self.session else ""
+            self.s.sendall(
+                f"{method} {uri} RTSP/1.0\r\nCSeq: {self.cseq}\r\nRequire: www.onvif.org/ver20/backchannel\r\n"
+                f"User-Agent: omacctv-talk\r\n{sess}{extra}{self._auth(method, uri)}\r\n".encode())
+            head, body = self._read()
+            code = int(head.split()[1])
+            a = re.search(r'WWW-Authenticate:\s*Digest\s+realm="([^"]+)",\s*nonce="([^"]+)"', head)
+            if code == 401 and a:
+                self.realm, self.nonce = a[1], a[2]
+                continue
+            if code != 200:
+                raise RuntimeError(f"{method} -> {head.splitlines()[0]}")
+            return head, body
+        raise RuntimeError(f"{method}: auth failed")
+
+    def open_backchannel(self):
+        head, sdp = self.req("DESCRIBE", self.base, "Accept: application/sdp\r\n")
+        cb = re.search(r"Content-Base:\s*(\S+)", head, re.I)
+        base = cb[1] if cb else self.base + "/"
+        control = None
+        for sec in re.split(r"\r?\nm=", sdp)[1:]:
+            if sec.startswith("audio") and "a=sendonly" in sec and re.search(r"RTP/AVP 0\b", sec):
+                c = re.search(r"a=control:(\S+)", sec)
+                control = c[1] if c else None
+        if not control:
+            raise RuntimeError("camera offers no PCMU backchannel")
+        uri = control if control.startswith("rtsp://") else base.rstrip("/") + "/" + control
+        head, _ = self.req("SETUP", uri, "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n")
+        self.session = re.search(r"Session:\s*([^;\r\n]+)", head)[1].strip()
+        ch = re.search(r"interleaved=(\d+)", head)
+        self.channel = int(ch[1]) if ch else 0
+        self.req("PLAY", self.base, "Range: npt=0.000-\r\n")
+        # Drain whatever the camera sends from now on.
+        self.s.settimeout(None)
+        threading.Thread(target=self._drain, daemon=True).start()
+
+    def _drain(self):
+        try:
+            while self.s.recv(65536):
+                pass
+        except OSError:
+            pass
+
+    def close(self):
+        try:
+            self.cseq += 1
+            self.s.sendall(f"TEARDOWN {self.base} RTSP/1.0\r\nCSeq: {self.cseq}\r\nSession: {self.session}\r\n"
+                           f"{self._auth('TEARDOWN', self.base)}\r\n".encode())
+        except OSError:
+            pass
+        self.s.close()
+
+
+def talk_rtsp(conn, url):
+    r = Rtsp(url)
+    r.open_backchannel()
+    conn.sendall(b"OK\n")
+    seq, ts, ssrc = random.randrange(65536), random.randrange(2**32), random.randrange(2**32)
+    pending = b""
+    last_keepalive = time.time()
+    while True:
+        data = conn.recv(4096)
+        if not data:
+            break
+        pending += data
+        while len(pending) >= 160:                      # 20 ms of 8 kHz mu-law
+            chunk, pending = pending[:160], pending[160:]
+            rtp = struct.pack(">BBHII", 0x80, 0, seq & 0xFFFF, ts & 0xFFFFFFFF, ssrc) + chunk
+            r.s.sendall(b"$" + bytes([r.channel]) + struct.pack(">H", len(rtp)) + rtp)
+            seq += 1
+            ts += 160
+        if time.time() - last_keepalive > 20:
+            last_keepalive = time.time()
+            r.cseq += 1
+            r.s.sendall(f"GET_PARAMETER {r.base} RTSP/1.0\r\nCSeq: {r.cseq}\r\nSession: {r.session}\r\n"
+                        f"{r._auth('GET_PARAMETER', r.base)}\r\n".encode())
+    r.close()
+
+
+class LocalSpeaker:
+    """The local speaker stays open all the time (silence when nobody talks).
+
+    On some sound cards (seen with a MacBook's CS8409 codec) opening playback while the same
+    card records stalls the recording, so it is opened once at start (start the relay before
+    the recorder, see Before= in the unit) and never closed."""
+
+    def __init__(self):
+        self.buf = bytearray()
+        self.lock = threading.Lock()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            p = subprocess.Popen(["aplay", "-q", "-D", ALSA, "-t", "raw", "-f", "MU_LAW", "-r", "8000", "-c", "1",
+                                  "--buffer-time=240000"], stdin=subprocess.PIPE)
+            log("speaker open")
+            nxt = time.monotonic()
+            try:
+                while True:
+                    with self.lock:
+                        if len(self.buf) >= 160:
+                            chunk = bytes(self.buf[:160])
+                            del self.buf[:160]
+                        else:
+                            chunk = b"\xff" * 160          # mu-law silence
+                        if len(self.buf) > 8000:            # never lag more than 1 s
+                            del self.buf[:-1600]
+                    p.stdin.write(chunk)
+                    p.stdin.flush()
+                    nxt += 0.02
+                    time.sleep(max(0.0, nxt - time.monotonic()))
+            except (BrokenPipeError, OSError) as e:
+                log(f"speaker closed: {e}")
+            p.kill()
+            p.wait()
+            time.sleep(2)
+
+    def feed(self, data):
+        with self.lock:
+            self.buf += data
+
+
+speaker = None
+
+
+def talk_local(conn):
+    conn.sendall(b"OK\n")
+    while True:
+        data = conn.recv(4096)
+        if not data:
+            break
+        speaker.feed(data)
+
+
+def handle(conn, addr):
+    cam = None
+    try:
+        conn.settimeout(10)
+        line = b""
+        while not line.endswith(b"\n") and len(line) < 100:
+            c = conn.recv(1)
+            if not c:
+                return
+            line += c
+        parts = line.decode(errors="replace").split()
+        if len(parts) != 2 or parts[0] != "TALK" or not re.fullmatch(r"[\w-]+", parts[1]):
+            conn.sendall(b"ERR bad request\n")
+            return
+        cam = parts[1]
+        url = os.environ.get("TALK_URL_" + cam.replace("-", "_"))
+        if cam != LOCAL and not url:
+            conn.sendall(b"ERR no speaker\n")
+            cam = None
+            return
+        with lock:
+            if cam in busy:
+                conn.sendall(b"ERR busy\n")
+                cam = None
+                return
+            busy.add(cam)
+        conn.settimeout(30)
+        log(f"talk {cam} from {addr[0]}")
+        if cam == LOCAL:
+            talk_local(conn)
+        else:
+            talk_rtsp(conn, url)
+        log(f"talk {cam} ended")
+    except Exception as e:
+        log(f"talk {cam}: {e}")
+        try:
+            conn.sendall(f"ERR {e}\n".encode())
+        except OSError:
+            pass
+    finally:
+        if cam:
+            with lock:
+                busy.discard(cam)
+        conn.close()
+
+
+def main():
+    global speaker
+    if LOCAL:
+        speaker = LocalSpeaker()
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", PORT))
+    srv.listen(4)
+    log(f"listening on {PORT}")
+    while True:
+        conn, addr = srv.accept()
+        # LAN and the home VPN only.
+        if not (addr[0].startswith("192.168.178.") or addr[0].startswith("127.")):
+            conn.close()
+            continue
+        threading.Thread(target=handle, args=(conn, addr), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()

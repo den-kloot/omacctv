@@ -1,0 +1,46 @@
+{
+  "_comment": "The setup this app was built for: Frigate 0.18 with go2rtc on a home server, three Reolink cameras and an old MacBook's webcam. Keys starting with _ are ignored.",
+  "frigate": "http://192.168.178.51:5000",
+  "rtsp": "rtsp://192.168.178.51:8554",
+  "talk_relay": "192.168.178.51:8557",
+  "cameras": [
+    {
+      "_comment": "Reolink RLC-540A at the front door, has a speaker",
+      "id": "entree",
+      "name": "Entrance",
+      "live_grid": "entree_sub",
+      "live_full": "entree_main",
+      "span": 1,
+      "aspect": 1.333,
+      "talk": true
+    },
+    {
+      "_comment": "Reolink RLC-520A, no speaker",
+      "id": "terasse",
+      "name": "Terrace",
+      "live_grid": "terasse_sub",
+      "live_full": "terasse_main",
+      "span": 1,
+      "aspect": 1.333
+    },
+    {
+      "_comment": "Reolink Duo 2V: main stream is 5120x1552 H.265, too heavy for a phone live, so the single view uses the sub stream too",
+      "id": "keller",
+      "name": "Basement",
+      "live_grid": "keller_sub",
+      "live_full": "keller_sub",
+      "span": 2,
+      "aspect": 3.333,
+      "heavy_record": true,
+      "talk": true
+    },
+    {
+      "_comment": "USB webcam of the server itself, talk goes to its own speaker (TALK_LOCAL on the relay)",
+      "id": "keller-cam-macbook",
+      "name": "Basement (Mac)",
+      "span": 2,
+      "aspect": 1.778,
+      "talk": true
+    }
+  ]
+}

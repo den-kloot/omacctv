@@ -1,0 +1,26 @@
+[Unit]
+Description=omacctv-talk-relay: two-way audio for OmaCCTV (phone -> camera ONVIF backchannel / local speaker)
+After=network-online.target sound.target
+# If a local recorder uses the same sound card as TALK_LOCAL's speaker, start before it:
+#Before=my-webcam-recorder.service
+Wants=network-online.target
+
+[Service]
+User=omacctv-talk
+Group=omacctv-talk
+SupplementaryGroups=audio
+EnvironmentFile=/etc/omacctv-talk-relay.env
+ExecStart=/usr/local/bin/omacctv-talk-relay
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=OmaCCTV
+GenericName=Cameras
+Comment=All Frigate cameras live, with a timeline through the recordings
+Exec=omacctv
+Icon=lu.kloot.OmaCCTV
+Terminal=false
+Categories=Video;Security;
+Keywords=camera;cctv;frigate;reolink;surveillance;
+StartupWMClass=lu.kloot.OmaCCTV
+StartupNotify=true
