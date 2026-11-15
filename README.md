@@ -23,10 +23,18 @@ The house number is pixelated and the basement is blurred for this README.*
 - **Grid:** all cameras live (go2rtc sub streams), silent, with a LIVE dot. Wide cameras such as the
   Reolink Duo get a full row. Tap a camera to open it big, with sound.
 - **Timeline:** a fixed yellow playhead with the day sliding underneath. Grey = footage, orange =
-  detection, red = alert (Frigate review items). Drag (with momentum) to scrub with Frigate
-  snapshots, release to play from there (Frigate HLS VOD). Tap to jump, tap a marker to jump to
-  that event. Pinch or tap 1 h / 6 h / 24 h to zoom, tap the date to pick another day, LIVE to go
+  detection, red = alert (Frigate review items). Drag (with momentum) to scrub: the picture follows
+  the finger (Frigate snapshots, the next one as soon as the last has arrived). Play/pause is a
+  lasting choice: while playing, a drag or tap plays on from the new spot (Frigate HLS VOD); while
+  paused it stays paused and shows that moment. Tap a marker to jump to that event. Pinch or tap 1 h / 6 h / 24 h to zoom, tap the date to pick another day, LIVE to go
   back. Gaps without footage are skipped.
+- **Speed:** 0.5x, 1x, 2x, 4x, 8x or 16x next to play/pause. From 8x (4x in the grid) only key
+  frames are decoded; sound up to 2x. The clock follows the picture when the network can't keep up
+  (a 4 MP camera's recordings are about 40 MB a minute, so 16x needs about 10 MB/s per camera).
+- **Share:** in the single view, a picture of the moment (full size from the recording, or what is
+  on screen live) or a video clip: start it, then play or slide to its end and tap Share (Frigate
+  cuts the MP4, up to 10 min). Saved to Pictures/OmaCCTV or Videos/OmaCCTV, then Copy (a picture
+  as PNG, a clip as a file), LocalSend or Show in Files.
 - **No footage at the chosen time:** each camera shows its last recorded picture before then
   ("Last picture · 10:20").
 - **Single view:** pinch to zoom, one finger to pan, double tap for 2.5x and back. Speaker button
@@ -159,12 +167,13 @@ While you talk, the camera sound on the phone is muted so the speaker doesn't fe
 ## How it works
 
 - `src/stream.rs`: one `ffmpeg` child per visible tile writes scaled RGB frames as PPM to a pipe.
-  Live streams use `-fflags nobuffer -flags low_delay`. Recordings are read at `-readrate 1` with
-  `-fps_mode passthrough`, otherwise ffmpeg duplicates frames. Sound only in the single view, as a
+  Live streams use `-fflags nobuffer -flags low_delay`. Recordings are read at `-readrate <speed>` with
+  `-fps_mode passthrough` (otherwise ffmpeg duplicates frames) and `-progress`, so the clock knows
+  where the picture is. Sound only in the single view, as a
   second ffmpeg output to PulseAudio (application name "OmaCCTV").
 - `src/frigate.rs`: recordings (`/api/<cam>/recordings`), review items (`/api/review`), scrub
   snapshots (`/api/<cam>/recordings/<t>/snapshot.jpg`), HLS VOD (`/vod/<cam>/start/S/end/E/master.m3u8`;
-  `index.m3u8` gives 404). The first picture of a tile is Frigate's `latest.jpg` until the stream's
+  `index.m3u8` gives 404), clips (`/api/<cam>/start/S/end/E/clip.mp4`). The first picture of a tile is Frigate's `latest.jpg` until the stream's
   first key frame arrives.
 - `src/rtsp.rs`: a small RTSP client (digest/basic auth, interleaved RTP) for DESCRIBE probes and the
   backchannel. `src/scan.rs`: WS-Discovery and the port sweep. `src/md5.rs`: MD5 for digest auth, so
