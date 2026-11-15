@@ -16,6 +16,8 @@ mod timeline;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use adw::prelude::*;
@@ -103,7 +105,7 @@ fn probe(args: &[String]) -> i32 {
                     println!("{:<20} no recording to play", cam.id);
                     continue;
                 };
-                stream::vod_args(&frigate::vod_url(&cfg, &cam.id, (r.1 - 60.0).max(r.0), r.1), 640, cam.heavy_record, false)
+                stream::vod_args(&frigate::vod_url(&cfg, &cam.id, (r.1 - 60.0).max(r.0), r.1), 640, cam.heavy_record, false, 1.0)
             }
         };
         streams.push((cam.id.clone(), slot.clone(), Stream::spawn(args, slot, data.is_none())));
@@ -160,6 +162,8 @@ struct Tile {
     /// Frame count when the current stream started (first new frame = it plays).
     started: Cell<u64>,
     snap_req: Cell<u64>,
+    /// A still picture is being fetched (one at a time per tile; the next waits for it).
+    fetching: Arc<AtomicBool>,
 }
 
 impl Tile {
@@ -239,6 +243,7 @@ impl Tile {
             key: RefCell::new(String::new()),
             started: Cell::new(0),
             snap_req: Cell::new(0),
+            fetching: Default::default(),
         })
     }
 
@@ -357,8 +362,14 @@ struct App {
     base: Cell<f64>,
     since: Cell<Option<Instant>>,
     paused: Cell<bool>,
+    /// The user wants playback (▶ pressed / LIVE): scrubbing or tapping the timeline keeps
+    /// playing from the new spot; after a pause it holds still at the new spot instead.
+    want_play: Cell<bool>,
+    /// Playback speed (one of stream::RATES).
+    rate: Cell<f64>,
     seek_at: Cell<Instant>,
-    /// Paused because the chosen time has no footage on any shown camera (▶ = next footage).
+    /// Paused showing still pictures of `base` (seek while paused; ▶ = play from there or
+    /// from the next footage).
     gap_hold: Cell<bool>,
     /// Sound in the single view (the grid is always silent).
     sound: Cell<bool>,
@@ -367,8 +378,6 @@ struct App {
     talk_btn: gtk::Button,
     talk_status: gtk::Label,
     talk_tx: async_channel::Sender<talk::Event>,
-    /// The last seek came from the user (not from skipping a gap during playback).
-    user_seek: Cell<bool>,
     gen: Cell<u64>,
     focus: Cell<Option<usize>>,
     tiles: Vec<Rc<Tile>>,
@@ -382,8 +391,8 @@ struct App {
     date_label: gtk::Label,
     live_btn: gtk::Button,
     play_btn: gtk::Button,
+    speed_btn: gtk::MenuButton,
     spans: Vec<(f64, gtk::ToggleButton)>,
-    scrub_due: Cell<Option<Instant>>,
     shown_second: Cell<i64>,
 }
 
@@ -393,7 +402,7 @@ impl App {
             Mode::Live => now(),
             Mode::Scrub => self.base.get(),
             Mode::Play => match (self.paused.get(), self.since.get()) {
-                (false, Some(s)) => self.base.get() + s.elapsed().as_secs_f64(),
+                (false, Some(s)) => self.base.get() + s.elapsed().as_secs_f64() * self.rate.get(),
                 _ => self.base.get(),
             },
         }
@@ -416,6 +425,7 @@ impl App {
     fn go_live(&self) {
         self.mode.set(Mode::Live);
         self.paused.set(false);
+        self.want_play.set(true);
         self.gap_hold.set(false);
         self.gen.set(self.gen.get() + 1);
         self.sync();
@@ -433,17 +443,31 @@ impl App {
         self.base.set(t);
         self.since.set(None);
         self.seek_at.set(Instant::now());
-        self.paused.set(false);
-        self.gap_hold.set(false);
-        self.user_seek.set(user);
+        // A seek while paused stays paused and shows the pictures at the new spot.
+        let hold = user && !self.want_play.get();
+        self.paused.set(hold);
+        self.gap_hold.set(hold);
         self.gen.set(self.gen.get() + 1);
         self.sync();
+    }
+
+    fn set_rate(&self, rate: f64) {
+        self.speed_btn.set_label(&stream::rate_label(rate));
+        if rate == self.rate.get() {
+            return;
+        }
+        let playing = self.mode.get() == Mode::Play && !self.paused.get();
+        let t = self.time();
+        self.rate.set(rate);
+        if playing {
+            // Same moment, now at the new speed.
+            self.start_at(t, false);
+        }
     }
 
     fn scrub(&self, t: f64) {
         self.mode.set(Mode::Scrub);
         self.base.set(t);
-        self.scrub_due.set(Some(Instant::now() + Duration::from_millis(180)));
         self.sync();
     }
 
@@ -453,23 +477,35 @@ impl App {
                 self.mode.set(Mode::Play);
                 self.base.set(now());
                 self.paused.set(true);
+                self.want_play.set(false);
             }
             Mode::Scrub => {
+                // Paused at the scrub position (its preview stays on screen).
                 self.paused.set(true);
+                self.gap_hold.set(true);
+                self.want_play.set(false);
                 self.mode.set(Mode::Play);
             }
-            Mode::Play if self.paused.get() && self.gap_hold.get() => {
+            Mode::Play if self.paused.get() => {
+                self.want_play.set(true);
+                let (cams, t) = (self.active_cams(), self.base.get());
+                let data = self.data.borrow();
+                if !data.loaded || cams.iter().any(|&c| data.run_at(c, t).is_some()) {
+                    drop(data);
+                    return self.start_at(t, false);
+                }
                 // ▶ in a gap: play from the next footage.
-                let next = self.data.borrow().next_start(&self.active_cams(), self.base.get());
+                let next = data.next_start(&cams, t);
+                drop(data);
                 return match next {
                     Some(n) => self.start_at(n, false),
                     None => self.go_live(),
                 };
             }
-            Mode::Play if self.paused.get() => return self.seek(self.base.get()),
             Mode::Play => {
                 self.base.set(self.time());
                 self.paused.set(true);
+                self.want_play.set(false);
             }
         }
         self.gen.set(self.gen.get() + 1);
@@ -538,16 +574,8 @@ impl App {
                 let data = self.data.borrow();
                 let cams = self.active_cams();
                 let mut t = self.time();
-                if data.loaded && !cams.iter().any(|&c| data.run_at(c, t).is_some()) && self.user_seek.get() {
-                    // The user picked a time without footage: hold there and show the last pictures before it.
-                    drop(data);
-                    self.paused.set(true);
-                    self.gap_hold.set(true);
-                    self.user_seek.set(false);
-                    return self.sync();
-                }
                 if data.loaded && !cams.iter().any(|&c| data.run_at(c, t).is_some()) {
-                    // Playback ran into a gap: jump to the next footage.
+                    // Playback (or a seek while playing) ran into a gap: jump to the next footage.
                     match data.next_start(&cams, t) {
                         Some(n) => {
                             self.base.set(n);
@@ -568,10 +596,11 @@ impl App {
                     match data.run_at(c, t) {
                         Some(run) => {
                             let audio = tile.full && self.sound.get();
-                            let key = format!("vod:{c}:{}:{:.0}:{}:{audio}", tile.full, run.0, self.gen.get());
+                            let rate = self.rate.get();
+                            let key = format!("vod:{c}:{}:{:.0}:{}:{audio}:{rate}", tile.full, run.0, self.gen.get());
                             let url = frigate::vod_url(&self.cfg, &cam.id, t, run.1 + 1.0);
                             let width = if tile.full { 1440 } else if cam.span == 2 { 1080 } else { 640 };
-                            tile.ensure(key, || stream::vod_args(&url, width, cam.heavy_record, audio), false);
+                            tile.ensure(key, || stream::vod_args(&url, width, cam.heavy_record, audio, rate), false);
                             tile.empty.set_visible(false);
                             tile.note.set_visible(false);
                         }
@@ -586,7 +615,6 @@ impl App {
                     && (active.iter().any(|t| t.has_new_frame()) || self.seek_at.get().elapsed() > Duration::from_secs(3))
                 {
                     self.since.set(Some(Instant::now()));
-                    self.user_seek.set(false);
                 }
             }
         }
@@ -596,7 +624,7 @@ impl App {
         self.update_controls();
     }
 
-    /// Scrub previews: one recording snapshot per shown camera, newest request wins.
+    /// Scrub previews: the picture at the playhead for every shown camera.
     fn request_snapshots(&self) {
         let t = self.base.get();
         for tile in self.active() {
@@ -607,6 +635,9 @@ impl App {
     /// A still picture for time `t`: the recording at `t`, or else the last picture recorded
     /// before `t` (with a note saying when), or "No footage" when there is none.
     fn still(&self, tile: &Tile, t: f64) {
+        if tile.fetching.load(Ordering::SeqCst) {
+            return;
+        }
         let data = self.data.borrow();
         let c = tile.cam.get();
         let (at, before) = if data.run_at(c, t).is_some() {
@@ -626,12 +657,16 @@ impl App {
             Some(end) => {
                 let day = |x: f64| fmt(x, "%Y%m%d");
                 let when = if day(end) == day(t) { fmt(end, "%H:%M") } else { fmt(end, "%a %e, %H:%M") };
-                tile.note.set_text(&format!("Last picture · {when}"));
+                let text = format!("Last picture · {when}");
+                if tile.note.text() != text {
+                    tile.note.set_text(&text);
+                }
                 tile.note.set_visible(true);
             }
             None => tile.note.set_visible(false),
         }
-        if (tile.still_at.get() - at).abs() < 0.01 {
+        if (tile.still_at.get() - at).abs() < 0.01 || tile.fetching.load(Ordering::SeqCst) {
+            // Same picture, or the previous one is still on its way: the caller asks again.
             return;
         }
         tile.still_at.set(at);
@@ -639,10 +674,13 @@ impl App {
         tile.snap_req.set(req);
         let (cfg, id, slot) = (self.cfg.clone(), self.cfg.cameras[c].id.clone(), tile.slot.clone());
         let height = if tile.full { 1080 } else { 360 };
+        let fetching = tile.fetching.clone();
+        fetching.store(true, Ordering::SeqCst);
         std::thread::spawn(move || {
             if let Ok(j) = frigate::snapshot(&cfg, &id, at, height) {
                 slot.lock().unwrap().jpeg = Some((req, j));
             }
+            fetching.store(false, Ordering::SeqCst);
         });
     }
 
@@ -655,7 +693,8 @@ impl App {
         }
         let playing = match self.mode.get() {
             Mode::Live => true,
-            Mode::Scrub => false,
+            // While scrubbing the button shows what happens on release.
+            Mode::Scrub => self.want_play.get(),
             Mode::Play => !self.paused.get(),
         };
         self.play_btn
@@ -816,6 +855,9 @@ window { background: #000; }
 .date { font-size: 12px; color: rgba(255,255,255,0.6); }
 .livebtn { border-radius: 999px; padding: 4px 14px; font-weight: 800; font-size: 13px; background: rgba(255,255,255,0.10); color: rgba(255,255,255,0.85); }
 .livebtn.on { background: #ff3b30; color: white; }
+.speedbtn > button { border-radius: 999px; padding: 2px 9px; min-height: 26px; font-weight: 700; font-size: 13px; font-feature-settings: "tnum"; background: rgba(255,255,255,0.10); }
+.speedrow { padding: 8px 28px; font-weight: 600; font-feature-settings: "tnum"; }
+.speedrow.on { color: #0a84ff; }
 .seg { background: rgba(255,255,255,0.08); border-radius: 9px; padding: 2px; }
 .seg button { border-radius: 7px; padding: 2px 14px; font-weight: 600; font-size: 13px; background: none; min-height: 26px; }
 .seg button:checked { background: rgba(255,255,255,0.22); }
@@ -929,6 +971,16 @@ fn build(app: &adw::Application) {
     play_btn.add_css_class("circular");
     play_btn.add_css_class("flat");
     play_btn.set_valign(gtk::Align::Center);
+    // Playback speed, next to ▶.
+    let speed_btn = gtk::MenuButton::new();
+    speed_btn.set_label(&stream::rate_label(1.0));
+    speed_btn.add_css_class("speedbtn");
+    speed_btn.set_always_show_arrow(false);
+    speed_btn.set_valign(gtk::Align::Center);
+    speed_btn.set_tooltip_text(Some("Playback speed"));
+    let left = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    left.append(&play_btn);
+    left.append(&speed_btn);
     let time_label = gtk::Label::new(Some("--:--:--"));
     time_label.add_css_class("clock");
     let date_label = gtk::Label::new(Some("Today"));
@@ -947,7 +999,7 @@ fn build(app: &adw::Application) {
     live_btn.add_css_class("on");
     live_btn.set_valign(gtk::Align::Center);
     let top = gtk::CenterBox::new();
-    top.set_start_widget(Some(&play_btn));
+    top.set_start_widget(Some(&left));
     top.set_center_widget(Some(&day_btn));
     top.set_end_widget(Some(&live_btn));
 
@@ -994,6 +1046,8 @@ fn build(app: &adw::Application) {
         base: Cell::new(now()),
         since: Cell::new(None),
         paused: Cell::new(false),
+        want_play: Cell::new(true),
+        rate: Cell::new(1.0),
         seek_at: Cell::new(Instant::now()),
         gap_hold: Cell::new(false),
         sound: Cell::new(true),
@@ -1001,7 +1055,6 @@ fn build(app: &adw::Application) {
         talk_btn: talk_btn.clone(),
         talk_status: talk_status.clone(),
         talk_tx,
-        user_seek: Cell::new(false),
         gen: Cell::new(0),
         focus: Cell::new(None),
         tiles: tiles.clone(),
@@ -1015,8 +1068,8 @@ fn build(app: &adw::Application) {
         date_label,
         live_btn: live_btn.clone(),
         play_btn: play_btn.clone(),
+        speed_btn: speed_btn.clone(),
         spans,
-        scrub_due: Cell::new(None),
         shown_second: Cell::new(0),
     });
     let a = &app_state;
@@ -1102,6 +1155,30 @@ fn build(app: &adw::Application) {
         if let Some(a) = w.upgrade() {
             a.toggle_pause();
         }
+    });
+    let w = Rc::downgrade(a);
+    speed_btn.set_create_popup_func(move |btn| {
+        let Some(a) = w.upgrade() else { return };
+        let pop = gtk::Popover::new();
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        for r in stream::RATES {
+            let b = gtk::Button::with_label(&stream::rate_label(r));
+            b.add_css_class("flat");
+            b.add_css_class("speedrow");
+            if r == a.rate.get() {
+                b.add_css_class("on");
+            }
+            let (w2, pop2) = (Rc::downgrade(&a), pop.clone());
+            b.connect_clicked(move |_| {
+                pop2.popdown();
+                if let Some(a) = w2.upgrade() {
+                    a.set_rate(r);
+                }
+            });
+            list.append(&b);
+        }
+        pop.set_child(Some(&list));
+        btn.set_popover(Some(&pop));
     });
     for (s, b) in &a.spans {
         let (w, s) = (Rc::downgrade(a), *s);
@@ -1192,11 +1269,10 @@ fn build(app: &adw::Application) {
             t.present();
         }
         a.update_clock();
-        if let Some(due) = a.scrub_due.get() {
-            if Instant::now() >= due && a.mode.get() == Mode::Scrub {
-                a.scrub_due.set(None);
-                a.request_snapshots();
-            }
+        // Scrub previews follow the finger: each camera fetches the picture at the current
+        // spot as soon as its previous one has arrived (still() skips unchanged times).
+        if a.mode.get() == Mode::Scrub || (a.mode.get() == Mode::Play && a.paused.get() && a.gap_hold.get()) {
+            a.request_snapshots();
         }
         glib::ControlFlow::Continue
     });

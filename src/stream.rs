@@ -46,17 +46,32 @@ fn scale(width: i32) -> String {
     format!("scale=w='min({width},iw)':h=-2:flags=bilinear")
 }
 
+/// Playback speeds offered next to the play button.
+pub const RATES: [f64; 6] = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
+
+/// Sound only up to this speed (time-stretched, so it stays in step with the picture).
+pub const MAX_AUDIO_RATE: f64 = 2.0;
+
+/// "0.5×", "1×", "16×".
+pub fn rate_label(rate: f64) -> String {
+    if rate.fract() == 0.0 { format!("{rate:.0}×") } else { format!("{rate}×") }
+}
+
 /// Outputs: scaled PPM frames on stdout, and with `audio` the first sound track to PipeWire
-/// (pulse) from the same process, so picture and sound stay together.
-fn outputs(a: &mut Vec<String>, width: i32, audio: bool) {
+/// (pulse) from the same process, so picture and sound stay together. `tempo` != 1 stretches
+/// the sound to the playback speed (pulse plays in real time and would otherwise hold ffmpeg back).
+fn outputs(a: &mut Vec<String>, width: i32, audio: bool, tempo: f64) {
     a.extend(["-map", "0:v:0", "-an", "-fps_mode", "passthrough", "-vf"].map(String::from));
     a.push(scale(width));
     a.extend(["-f", "image2pipe", "-c:v", "ppm", "-"].map(String::from));
     if audio {
         a.extend(
-            ["-map", "0:a:0?", "-vn", "-ac", "2", "-ar", "48000", "-f", "pulse", "-name", "OmaCCTV", "-stream_name", "Camera", "default"]
-                .map(String::from),
+            ["-map", "0:a:0?", "-vn", "-ac", "2", "-ar", "48000"].map(String::from),
         );
+        if tempo != 1.0 {
+            a.extend(["-af".into(), format!("atempo={tempo}")]);
+        }
+        a.extend(["-f", "pulse", "-name", "OmaCCTV", "-stream_name", "Camera", "default"].map(String::from));
     }
 }
 
@@ -71,19 +86,24 @@ pub fn live_args(url: &str, width: i32, audio: bool) -> Vec<String> {
     }
     a.push("-i".into());
     a.push(url.into());
-    outputs(&mut a, width, audio);
+    outputs(&mut a, width, audio, 1.0);
     a
 }
 
-/// ffmpeg arguments for a recording (HLS from Frigate), paced in real time.
-pub fn vod_args(url: &str, width: i32, heavy: bool, audio: bool) -> Vec<String> {
+/// ffmpeg arguments for a recording (HLS from Frigate), paced at `rate` × real time.
+/// Fast playback decodes only key frames (a phone can't decode 4+ streams at 8×), heavy
+/// cameras already from 2×; sound only up to MAX_AUDIO_RATE.
+pub fn vod_args(url: &str, width: i32, heavy: bool, audio: bool, rate: f64) -> Vec<String> {
     let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin"].map(String::from).to_vec();
     if heavy {
         a.extend(["-skip_loop_filter", "all"].map(String::from));
     }
-    a.extend(["-readrate", "1", "-i"].map(String::from));
+    if rate >= 4.0 || (heavy && rate >= 2.0) {
+        a.extend(["-skip_frame", "nokey"].map(String::from));
+    }
+    a.extend(["-readrate".into(), format!("{rate}"), "-i".into()]);
     a.push(url.into());
-    outputs(&mut a, width, audio);
+    outputs(&mut a, width, audio && rate <= MAX_AUDIO_RATE, rate);
     a
 }
 
@@ -201,5 +221,21 @@ mod tests {
         let s = slot.lock().unwrap();
         assert_eq!(s.count, 2);
         assert_eq!(s.frame.as_ref().unwrap().rgb, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn vod_speed_args() {
+        let a = vod_args("u", 640, false, true, 1.0);
+        assert!(a.windows(2).any(|w| w == ["-readrate", "1"]));
+        assert!(!a.iter().any(|x| x == "nokey" || x.starts_with("atempo")));
+        let a = vod_args("u", 640, false, true, 2.0);
+        assert!(a.iter().any(|x| x == "atempo=2") && !a.iter().any(|x| x == "nokey"));
+        let a = vod_args("u", 640, false, true, 0.5);
+        assert!(a.windows(2).any(|w| w == ["-readrate", "0.5"]) && a.iter().any(|x| x == "atempo=0.5"));
+        let a = vod_args("u", 640, false, true, 16.0);
+        assert!(a.iter().any(|x| x == "nokey") && !a.iter().any(|x| x == "pulse"));
+        assert!(vod_args("u", 640, true, false, 2.0).iter().any(|x| x == "nokey"));
+        assert_eq!(rate_label(0.5), "0.5×");
+        assert_eq!(rate_label(16.0), "16×");
     }
 }
