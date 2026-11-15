@@ -11,6 +11,34 @@ use crate::config::Config;
 
 /// Plain HTTP/1.0 GET (Frigate is on the LAN, no TLS; 1.0 = no chunked bodies).
 pub fn get(url: &str, timeout: Duration) -> Result<Vec<u8>, String> {
+    let (mut s, mut body) = request(url, timeout)?;
+    s.read_to_end(&mut body).map_err(|e| e.to_string())?;
+    Ok(body)
+}
+
+/// GET `url` straight into the file `path` (written as `path.part`, renamed when complete),
+/// so a long clip never sits in memory. Returns the size.
+pub fn download(url: &str, path: &std::path::Path, timeout: Duration) -> Result<u64, String> {
+    let (mut s, head) = request(url, timeout)?;
+    let part = path.with_extension("part");
+    let r = (|| {
+        let mut f = std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+        f.write_all(&head).map_err(|e| e.to_string())?;
+        let n = std::io::copy(&mut s, &mut f).map_err(|e| e.to_string())? + head.len() as u64;
+        if n == 0 {
+            return Err("empty reply (no footage in that range?)".to_string());
+        }
+        std::fs::rename(&part, path).map_err(|e| e.to_string())?;
+        Ok(n)
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    r
+}
+
+/// Sends the request and reads the reply header: the stream, plus the body bytes read with it.
+fn request(url: &str, timeout: Duration) -> Result<(TcpStream, Vec<u8>), String> {
     let rest = url.strip_prefix("http://").ok_or("only http:// urls")?;
     let (hostport, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -29,14 +57,26 @@ pub fn get(url: &str, timeout: Duration) -> Result<Vec<u8>, String> {
     write!(s, "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: omacctv\r\nConnection: close\r\n\r\n")
         .map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
-    s.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-    let end = buf.windows(4).position(|w| w == b"\r\n\r\n").ok_or("bad http reply")?;
+    let mut chunk = [0u8; 16384];
+    let end = loop {
+        if let Some(e) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break e;
+        }
+        if buf.len() > 65536 {
+            return Err("bad http reply".into());
+        }
+        let n = s.read(&mut chunk).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("bad http reply".into());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
     let head = String::from_utf8_lossy(&buf[..end]);
     let status = head.split_whitespace().nth(1).unwrap_or("");
     if status != "200" {
         return Err(format!("HTTP {status} for {path}"));
     }
-    Ok(buf[end + 4..].to_vec())
+    Ok((s, buf[end + 4..].to_vec()))
 }
 
 fn get_json(url: &str) -> Result<Value, String> {
@@ -167,12 +207,15 @@ pub fn load(cfg: &Config, days: f64) -> Result<Data, String> {
     Ok(Data { runs, events, loaded: true })
 }
 
-/// A JPEG of camera `id` at time `t`, `height` pixels high.
+/// A JPEG of camera `id` at time `t`, `height` pixels high (0 = the recording's full size).
 pub fn snapshot(cfg: &Config, id: &str, t: f64, height: i32) -> Result<Vec<u8>, String> {
-    get(
-        &format!("{}/api/{id}/recordings/{t:.2}/snapshot.jpg?height={height}", cfg.frigate),
-        Duration::from_secs(8),
-    )
+    let q = if height > 0 { format!("?height={height}") } else { String::new() };
+    get(&format!("{}/api/{id}/recordings/{t:.2}/snapshot.jpg{q}", cfg.frigate), Duration::from_secs(8))
+}
+
+/// The recording of camera `id` from `start` to `end` as one MP4 (Frigate cuts it on request).
+pub fn clip_url(cfg: &Config, id: &str, start: f64, end: f64) -> String {
+    format!("{}/api/{id}/start/{start:.2}/end/{end:.2}/clip.mp4", cfg.frigate)
 }
 
 /// HLS playlist of camera `id` from `start` to `end` (Frigate's nginx VOD).

@@ -18,6 +18,8 @@ pub struct Inner {
     runs: RefCell<Vec<(f64, f64)>>,
     /// (start, end, alert)
     events: RefCell<Vec<(f64, f64, bool)>>,
+    /// Start of the clip being chosen: the range from it to the playhead is highlighted.
+    clip: Cell<Option<f64>>,
     drag0: Cell<f64>,
     press_x: Cell<f64>,
     dragging: Cell<bool>,
@@ -103,6 +105,11 @@ impl Timeline {
 
     pub fn set_span(&self, span: f64) {
         self.inner.span.set(span.clamp(MIN_SPAN, MAX_SPAN));
+        self.area.queue_draw();
+    }
+
+    pub fn set_clip(&self, start: Option<f64>) {
+        self.inner.clip.set(start);
         self.area.queue_draw();
     }
 
@@ -306,6 +313,23 @@ impl Timeline {
                 let bw = (xb - xa).max(5.0);
                 rounded(cr, xa, ty + 5.0, bw, th - 10.0, 3.0);
                 let _ = cr.fill();
+            }
+        }
+
+        // The clip being chosen: from its start to the playhead.
+        if let Some(cs) = i.clip.get() {
+            let c = i.center.get();
+            let (a, b) = (x(cs.min(c)).max(-10.0), x(cs.max(c)).min(w + 10.0));
+            cr.set_source_rgba(1.0, 0.84, 0.04, 0.30);
+            rounded(cr, a, ty - 3.0, (b - a).max(2.0), th + 6.0, 4.0);
+            let _ = cr.fill();
+            let xs = x(cs).round();
+            if (-2.0..=w + 2.0).contains(&xs) {
+                cr.set_source_rgba(1.0, 0.84, 0.04, 1.0);
+                cr.set_line_width(2.0);
+                cr.move_to(xs, ty - 3.0);
+                cr.line_to(xs, ty + th + 3.0);
+                let _ = cr.stroke();
             }
         }
 

@@ -21,6 +21,9 @@ pub struct SlotInner {
     pub count: u64,
     /// A JPEG (scrub preview) with its request id.
     pub jpeg: Option<(u64, Vec<u8>)>,
+    /// Recordings: how far ffmpeg has got, in seconds of footage from where it started,
+    /// while it runs (None before its first report and after it ended).
+    pub progress: Option<f64>,
 }
 
 pub type Slot = Arc<Mutex<SlotInner>>;
@@ -93,18 +96,37 @@ pub fn live_args(url: &str, width: i32, audio: bool) -> Vec<String> {
 /// ffmpeg arguments for a recording (HLS from Frigate), paced at `rate` × real time.
 /// Fast playback decodes only key frames (a phone can't decode 4+ streams at 8×), heavy
 /// cameras already from 2×; sound only up to MAX_AUDIO_RATE.
-pub fn vod_args(url: &str, width: i32, heavy: bool, audio: bool, rate: f64) -> Vec<String> {
-    let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin"].map(String::from).to_vec();
+/// `full` = the single view (one camera: full decoding up to 4×).
+pub fn vod_args(url: &str, width: i32, heavy: bool, audio: bool, rate: f64, full: bool) -> Vec<String> {
+    let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin", "-nostats"].map(String::from).to_vec();
+    // Progress reports on stderr: the clock follows the picture when the network or the
+    // decoder can't keep up with the speed.
+    a.extend(["-progress", "pipe:2", "-stats_period", "0.2"].map(String::from));
     if heavy {
         a.extend(["-skip_loop_filter", "all"].map(String::from));
     }
-    if rate >= 4.0 || (heavy && rate >= 2.0) {
+    if rate >= 8.0 || (rate >= 4.0 && !full) || (heavy && rate >= 2.0) {
         a.extend(["-skip_frame", "nokey"].map(String::from));
     }
     a.extend(["-readrate".into(), format!("{rate}"), "-i".into()]);
     a.push(url.into());
     outputs(&mut a, width, audio && rate <= MAX_AUDIO_RATE, rate);
     a
+}
+
+/// Reads ffmpeg's `-progress` lines into the slot; other lines are its error messages.
+fn read_progress(r: impl Read, slot: &Slot) {
+    use std::io::BufRead;
+    for line in BufReader::new(r).lines() {
+        let Ok(line) = line else { return };
+        if let Some(us) = line.strip_prefix("out_time_us=") {
+            if let Ok(us) = us.trim().parse::<i64>() {
+                slot.lock().unwrap().progress = Some(us.max(0) as f64 / 1e6);
+            }
+        } else if !line.contains('=') && std::env::var_os("OMACCTV_DEBUG").is_some() {
+            eprintln!("{line}");
+        }
+    }
 }
 
 /// Reads one PPM header token (skipping whitespace); `None` at end of stream.
@@ -158,12 +180,16 @@ impl Stream {
         std::thread::spawn(move || {
             let mut backoff = 1;
             while !stop2.load(Ordering::SeqCst) {
-                let spawned = Command::new("ffmpeg")
-                    .args(&args)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(if std::env::var_os("OMACCTV_DEBUG").is_some() { Stdio::inherit() } else { Stdio::null() })
-                    .spawn();
+                let progress = args.iter().any(|a| a == "-progress");
+                let stderr = if progress {
+                    Stdio::piped()
+                } else if std::env::var_os("OMACCTV_DEBUG").is_some() {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                };
+                slot.lock().unwrap().progress = None;
+                let spawned = Command::new("ffmpeg").args(&args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(stderr).spawn();
                 let mut c = match spawned {
                     Ok(c) => c,
                     Err(e) => {
@@ -172,6 +198,15 @@ impl Stream {
                     }
                 };
                 let out = c.stdout.take();
+                if let Some(err) = c.stderr.take() {
+                    let (slot, stop) = (slot.clone(), stop2.clone());
+                    std::thread::spawn(move || {
+                        read_progress(err, &slot);
+                        if !stop.load(Ordering::SeqCst) {
+                            slot.lock().unwrap().progress = None;
+                        }
+                    });
+                }
                 {
                     let mut g = child2.lock().unwrap();
                     if stop2.load(Ordering::SeqCst) {
@@ -189,6 +224,7 @@ impl Stream {
                     let _ = c.kill();
                     let _ = c.wait();
                 }
+                slot.lock().unwrap().progress = None;
                 if !restart {
                     return;
                 }
@@ -225,16 +261,22 @@ mod tests {
 
     #[test]
     fn vod_speed_args() {
-        let a = vod_args("u", 640, false, true, 1.0);
+        let a = vod_args("u", 640, false, true, 1.0, false);
         assert!(a.windows(2).any(|w| w == ["-readrate", "1"]));
         assert!(!a.iter().any(|x| x == "nokey" || x.starts_with("atempo")));
-        let a = vod_args("u", 640, false, true, 2.0);
+        let a = vod_args("u", 640, false, true, 2.0, false);
         assert!(a.iter().any(|x| x == "atempo=2") && !a.iter().any(|x| x == "nokey"));
-        let a = vod_args("u", 640, false, true, 0.5);
+        let a = vod_args("u", 640, false, true, 0.5, false);
         assert!(a.windows(2).any(|w| w == ["-readrate", "0.5"]) && a.iter().any(|x| x == "atempo=0.5"));
-        let a = vod_args("u", 640, false, true, 16.0);
+        let a = vod_args("u", 640, false, true, 16.0, true);
         assert!(a.iter().any(|x| x == "nokey") && !a.iter().any(|x| x == "pulse"));
-        assert!(vod_args("u", 640, true, false, 2.0).iter().any(|x| x == "nokey"));
+        assert!(vod_args("u", 640, true, false, 2.0, true).iter().any(|x| x == "nokey"));
+        assert!(vod_args("u", 640, false, false, 4.0, false).iter().any(|x| x == "nokey"));
+        assert!(!vod_args("u", 640, false, false, 4.0, true).iter().any(|x| x == "nokey"));
+        let mut lines = &b"frame=3\nout_time_us=2500000\nprogress=continue\n"[..];
+        let slot: Slot = Default::default();
+        read_progress(&mut lines, &slot);
+        assert_eq!(slot.lock().unwrap().progress, Some(2.5));
         assert_eq!(rate_label(0.5), "0.5×");
         assert_eq!(rate_label(16.0), "16×");
     }

@@ -9,6 +9,7 @@ mod config;
 mod md5;
 mod rtsp;
 mod scan;
+mod share;
 mod frigate;
 mod stream;
 mod talk;
@@ -105,7 +106,7 @@ fn probe(args: &[String]) -> i32 {
                     println!("{:<20} no recording to play", cam.id);
                     continue;
                 };
-                stream::vod_args(&frigate::vod_url(&cfg, &cam.id, (r.1 - 60.0).max(r.0), r.1), 640, cam.heavy_record, false, 1.0)
+                stream::vod_args(&frigate::vod_url(&cfg, &cam.id, (r.1 - 60.0).max(r.0), r.1), 640, cam.heavy_record, false, 1.0, false)
             }
         };
         streams.push((cam.id.clone(), slot.clone(), Stream::spawn(args, slot, data.is_none())));
@@ -162,6 +163,8 @@ struct Tile {
     /// Frame count when the current stream started (first new frame = it plays).
     started: Cell<u64>,
     snap_req: Cell<u64>,
+    /// Footage time where the tile's recording stream started (its progress counts from here).
+    vod_t0: Cell<f64>,
     /// A still picture is being fetched (one at a time per tile; the next waits for it).
     fetching: Arc<AtomicBool>,
 }
@@ -244,6 +247,7 @@ impl Tile {
             started: Cell::new(0),
             snap_req: Cell::new(0),
             fetching: Default::default(),
+            vod_t0: Cell::new(0.0),
         })
     }
 
@@ -394,6 +398,22 @@ struct App {
     speed_btn: gtk::MenuButton,
     spans: Vec<(f64, gtk::ToggleButton)>,
     shown_second: Cell<i64>,
+    window: adw::ApplicationWindow,
+    toasts: adw::ToastOverlay,
+    /// Start of the clip being chosen (single view); the playhead is its other end.
+    clip_start: Cell<Option<f64>>,
+    clip_bar: gtk::Box,
+    clip_label: gtk::Label,
+    clip_go: gtk::Button,
+    /// A clip is being cut and downloaded.
+    clip_busy: Cell<bool>,
+    share_tx: async_channel::Sender<ShareDone>,
+}
+
+/// A picture or clip saved for sharing (or why not).
+struct ShareDone {
+    result: Result<std::path::PathBuf, String>,
+    video: bool,
 }
 
 impl App {
@@ -402,10 +422,27 @@ impl App {
             Mode::Live => now(),
             Mode::Scrub => self.base.get(),
             Mode::Play => match (self.paused.get(), self.since.get()) {
-                (false, Some(s)) => self.base.get() + s.elapsed().as_secs_f64() * self.rate.get(),
+                (false, Some(s)) => {
+                    let wall = self.base.get() + s.elapsed().as_secs_f64() * self.rate.get();
+                    match self.shown_progress() {
+                        // Not further ahead of the picture than normal: reports come every
+                        // 0.2 s, and fast playback shows only key frames (~2 s apart).
+                        Some(p) => wall.min(p + 2.5 + 0.6 * self.rate.get()),
+                        None => wall,
+                    }
+                }
                 _ => self.base.get(),
             },
         }
+    }
+
+    /// Footage time the furthest running recording stream has reached.
+    fn shown_progress(&self) -> Option<f64> {
+        self.active()
+            .iter()
+            .filter(|t| t.key.borrow().starts_with("vod:"))
+            .filter_map(|t| t.slot.lock().unwrap().progress.map(|p| t.vod_t0.get() + p))
+            .reduce(f64::max)
     }
 
     fn active(&self) -> Vec<Rc<Tile>> {
@@ -571,6 +608,15 @@ impl App {
                 }
             }
             Mode::Play => {
+                // The picture fell behind the clock (too fast for the network or decoder):
+                // the clock goes on from the picture.
+                if let Some(s) = self.since.get() {
+                    let t = self.time();
+                    if self.base.get() + s.elapsed().as_secs_f64() * self.rate.get() > t + 0.01 {
+                        self.base.set(t);
+                        self.since.set(Some(Instant::now()));
+                    }
+                }
                 let data = self.data.borrow();
                 let cams = self.active_cams();
                 let mut t = self.time();
@@ -600,7 +646,14 @@ impl App {
                             let key = format!("vod:{c}:{}:{:.0}:{}:{audio}:{rate}", tile.full, run.0, self.gen.get());
                             let url = frigate::vod_url(&self.cfg, &cam.id, t, run.1 + 1.0);
                             let width = if tile.full { 1440 } else if cam.span == 2 { 1080 } else { 640 };
-                            tile.ensure(key, || stream::vod_args(&url, width, cam.heavy_record, audio, rate), false);
+                            tile.ensure(
+                                key,
+                                || {
+                                    tile.vod_t0.set(t);
+                                    stream::vod_args(&url, width, cam.heavy_record, audio, rate, tile.full)
+                                },
+                                false,
+                            );
                             tile.empty.set_visible(false);
                             tile.note.set_visible(false);
                         }
@@ -803,7 +856,181 @@ impl App {
         }
     }
 
+    fn toast(&self, msg: &str) {
+        let t = adw::Toast::new(msg);
+        t.set_timeout(3);
+        self.toasts.add_toast(t);
+    }
+
+    /// The picture on screen in the single view, as PNG.
+    fn shown_png(&self) -> Option<Vec<u8>> {
+        let p = self.single.picture.paintable()?;
+        let tex = p.downcast::<gdk::Texture>().ok()?;
+        Some(tex.save_to_png_bytes().to_vec())
+    }
+
+    /// Saves the picture at the playhead: from the recording in full size when there is one,
+    /// else what is on screen (live, or a camera without recordings).
+    fn share_picture(&self) {
+        let Some(c) = self.focus.get() else { return };
+        let cam = self.cfg.cameras[c].clone();
+        let t = self.time();
+        let shown = self.shown_png();
+        let recording = self.mode.get() != Mode::Live
+            && cam.recorded()
+            && self.cfg.has_frigate
+            && self.data.borrow().run_at(c, t).is_some();
+        if !recording {
+            let Some(png) = shown else { return self.toast("No picture yet") };
+            let path = share::out_path(false, &cam.id, t, "png");
+            let result = std::fs::write(&path, png).map(|_| path).map_err(|e| e.to_string());
+            let _ = self.share_tx.try_send(ShareDone { result, video: false });
+            return;
+        }
+        let (cfg, tx) = (self.cfg.clone(), self.share_tx.clone());
+        std::thread::spawn(move || {
+            let result = match frigate::snapshot(&cfg, &cam.id, t, 0) {
+                Ok(jpg) => {
+                    let path = share::out_path(false, &cam.id, t, "jpg");
+                    std::fs::write(&path, jpg).map(|_| path).map_err(|e| e.to_string())
+                }
+                Err(e) => match shown {
+                    Some(png) => {
+                        let path = share::out_path(false, &cam.id, t, "png");
+                        std::fs::write(&path, png).map(|_| path).map_err(|e| e.to_string())
+                    }
+                    None => Err(e),
+                },
+            };
+            let _ = tx.send_blocking(ShareDone { result, video: false });
+        });
+    }
+
+    fn clip_begin(&self) {
+        let t = self.time();
+        self.clip_start.set(Some(t));
+        self.clip_busy.set(false);
+        self.timeline.set_clip(Some(t));
+        self.talk_btn.set_visible(false);
+        self.clip_bar.set_visible(true);
+        self.clip_label.set_text("");
+        self.update_clip();
+    }
+
+    fn clip_range(&self) -> Option<(f64, f64)> {
+        let s = self.clip_start.get()?;
+        let t = self.time().min(now());
+        Some((s.min(t), s.max(t)))
+    }
+
+    /// The clip bar: length and times of the range chosen so far.
+    fn update_clip(&self) {
+        let Some((a, b)) = self.clip_range() else { return };
+        if self.clip_busy.get() {
+            return;
+        }
+        let len = b - a;
+        let text = if len < 1.0 {
+            "Play or slide to the clip's end".to_string()
+        } else if len > share::MAX_CLIP {
+            format!("{} · longer than {} min", share::duration_label(len), (share::MAX_CLIP / 60.0) as i64)
+        } else {
+            format!("{} · {} – {}", share::duration_label(len), fmt(a, "%H:%M:%S"), fmt(b, "%H:%M:%S"))
+        };
+        if self.clip_label.text() != text {
+            self.clip_label.set_text(&text);
+        }
+        self.clip_go.set_sensitive(len >= 1.0 && len <= share::MAX_CLIP);
+    }
+
+    fn clip_cancel(&self) {
+        self.clip_start.set(None);
+        self.clip_busy.set(false);
+        self.timeline.set_clip(None);
+        self.clip_bar.set_visible(false);
+        if let Some(c) = self.focus.get() {
+            self.talk_btn.set_visible(self.cfg.cameras[c].can_talk(&self.cfg.talk_relay));
+        }
+    }
+
+    /// Frigate cuts the chosen range into one MP4; it is saved to Videos/OmaCCTV.
+    fn clip_share(&self) {
+        let (Some(c), Some((a, b))) = (self.focus.get(), self.clip_range()) else { return };
+        self.clip_busy.set(true);
+        self.clip_go.set_sensitive(false);
+        self.clip_label.set_text("Preparing clip …");
+        let (cfg, id, tx) = (self.cfg.clone(), self.cfg.cameras[c].id.clone(), self.share_tx.clone());
+        std::thread::spawn(move || {
+            let path = share::out_path(true, &id, a, "mp4");
+            let result = frigate::download(&frigate::clip_url(&cfg, &id, a, b), &path, Duration::from_secs(120)).map(|_| path);
+            let _ = tx.send_blocking(ShareDone { result, video: true });
+        });
+    }
+
+    fn share_done(self: &Rc<Self>, d: ShareDone) {
+        if d.video {
+            if d.result.is_ok() {
+                self.clip_cancel();
+            } else {
+                self.clip_busy.set(false);
+                self.update_clip();
+            }
+        }
+        let path = match d.result {
+            Ok(p) => p,
+            Err(e) => return self.toast(&format!("Couldn't save: {e}")),
+        };
+        let shown = path.strip_prefix(glib::home_dir()).map(|p| p.display().to_string()).unwrap_or(path.display().to_string());
+        let dialog = adw::AlertDialog::new(Some(if d.video { "Clip saved" } else { "Picture saved" }), Some(&shown));
+        if !d.video {
+            let pic = gtk::Picture::for_filename(&path);
+            pic.set_can_shrink(true);
+            pic.set_size_request(-1, 170);
+            pic.add_css_class("share-preview");
+            dialog.set_extra_child(Some(&pic));
+        }
+        dialog.add_response("copy", "Copy");
+        if share::localsend().is_some() {
+            dialog.add_response("send", "LocalSend");
+        }
+        dialog.add_response("files", "Show in Files");
+        dialog.add_response("close", "Done");
+        dialog.set_response_appearance("copy", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("copy"));
+        dialog.set_close_response("close");
+        let (w, video) = (Rc::downgrade(self), d.video);
+        dialog.connect_response(None, move |_, r| {
+            let Some(a) = w.upgrade() else { return };
+            match r {
+                "copy" => match share::copy(&path, video, &gtk::prelude::WidgetExt::display(&a.window)) {
+                    Ok(()) => a.toast(if video { "Clip copied · paste it into a chat" } else { "Picture copied" }),
+                    Err(e) => a.toast(&e),
+                },
+                "send" => {
+                    if let Err(e) = share::send(&path) {
+                        a.toast(&e);
+                    }
+                }
+                "files" => {
+                    let w2 = Rc::downgrade(&a);
+                    gtk::FileLauncher::new(Some(&gtk::gio::File::for_path(&path))).open_containing_folder(
+                        Some(&a.window),
+                        None::<&gtk::gio::Cancellable>,
+                        move |r| {
+                            if let (Err(e), Some(a)) = (r, w2.upgrade()) {
+                                a.toast(&e.to_string());
+                            }
+                        },
+                    );
+                }
+                _ => {}
+            }
+        });
+        dialog.present(Some(&self.window));
+    }
+
     fn open(self: &Rc<Self>, c: usize) {
+        self.clip_cancel();
         self.talk_stop();
         self.talk_btn.set_visible(self.cfg.cameras[c].can_talk(&self.cfg.talk_relay));
         self.single.set_zoom(1.0, 0.0, 0.0);
@@ -827,6 +1054,7 @@ impl App {
         if self.focus.get().is_none() {
             return;
         }
+        self.clip_cancel();
         self.talk_stop();
         self.focus.set(None);
         self.refresh_timeline();
@@ -862,6 +1090,11 @@ window { background: #000; }
 .seg button { border-radius: 7px; padding: 2px 14px; font-weight: 600; font-size: 13px; background: none; min-height: 26px; }
 .seg button:checked { background: rgba(255,255,255,0.22); }
 .dayrow { padding: 8px 14px; }
+.clipbar { background: rgba(0,0,0,0.70); border-radius: 999px; padding: 4px; color: white; }
+.clipbar label { font-weight: 600; font-size: 13px; font-feature-settings: "tnum"; }
+.clipbar .go { border-radius: 999px; padding: 4px 16px; font-weight: 700; }
+.menurow { padding: 8px 18px; }
+.share-preview { border-radius: 10px; }
 "#;
 
 fn build(app: &adw::Application) {
@@ -932,7 +1165,8 @@ fn build(app: &adw::Application) {
     let single = Tile::new(true);
     single.root.set_vexpand(true);
     let single_view = adw::ToolbarView::new();
-    single_view.add_top_bar(&adw::HeaderBar::new());
+    let single_header = adw::HeaderBar::new();
+    single_view.add_top_bar(&single_header);
     single_view.set_content(Some(&single.root));
     let single_page = adw::NavigationPage::new(&single_view, "Camera");
     let sound_btn = gtk::Button::from_icon_name("audio-volume-high-symbolic");
@@ -961,6 +1195,34 @@ fn build(app: &adw::Application) {
     talk_status.set_visible(false);
     single.root.add_overlay(&talk_status);
     let (talk_tx, talk_rx) = async_channel::unbounded::<talk::Event>();
+
+    // Share: a picture of this moment, or a clip (choose its range on the timeline).
+    let share_btn = gtk::MenuButton::new();
+    share_btn.set_icon_name("send-to-symbolic");
+    share_btn.set_tooltip_text(Some("Share"));
+    single_header.pack_end(&share_btn);
+    let clip_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    clip_bar.add_css_class("clipbar");
+    let clip_x = gtk::Button::from_icon_name("window-close-symbolic");
+    clip_x.add_css_class("circular");
+    clip_x.add_css_class("flat");
+    clip_x.set_tooltip_text(Some("Cancel clip"));
+    let clip_label = gtk::Label::new(None);
+    clip_label.set_hexpand(true);
+    clip_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let clip_go = gtk::Button::with_label("Share");
+    clip_go.add_css_class("suggested-action");
+    clip_go.add_css_class("go");
+    clip_bar.append(&clip_x);
+    clip_bar.append(&clip_label);
+    clip_bar.append(&clip_go);
+    clip_bar.set_valign(gtk::Align::End);
+    clip_bar.set_margin_start(12);
+    clip_bar.set_margin_end(64);
+    clip_bar.set_margin_bottom(14);
+    clip_bar.set_visible(false);
+    single.root.add_overlay(&clip_bar);
+    let (share_tx, share_rx) = async_channel::unbounded::<ShareDone>();
 
     let nav = adw::NavigationView::new();
     nav.add(&grid_page);
@@ -1031,12 +1293,14 @@ fn build(app: &adw::Application) {
     content.append(&nav);
     content.append(&controls);
 
+    let toasts = adw::ToastOverlay::new();
+    toasts.set_child(Some(&content));
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Cameras")
         .default_width(405)
         .default_height(860)
-        .content(&content)
+        .content(&toasts)
         .build();
 
     let app_state = Rc::new(App {
@@ -1071,6 +1335,14 @@ fn build(app: &adw::Application) {
         speed_btn: speed_btn.clone(),
         spans,
         shown_second: Cell::new(0),
+        window: window.clone(),
+        toasts,
+        clip_start: Cell::new(None),
+        clip_bar: clip_bar.clone(),
+        clip_label,
+        clip_go: clip_go.clone(),
+        clip_busy: Cell::new(false),
+        share_tx,
     });
     let a = &app_state;
     a.set_span(3600.0);
@@ -1135,6 +1407,59 @@ fn build(app: &adw::Application) {
     talk_btn.connect_clicked(move |_| {
         if let Some(a) = w.upgrade() {
             a.talk_toggle();
+        }
+    });
+    let w = Rc::downgrade(a);
+    share_btn.set_create_popup_func(move |btn| {
+        let Some(a) = w.upgrade() else { return };
+        let Some(c) = a.focus.get() else { return };
+        let pop = gtk::Popover::new();
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let mut items: Vec<(&str, &str, u8)> = vec![("camera-photo-symbolic", "Picture", 0)];
+        if a.cfg.cameras[c].recorded() && a.cfg.has_frigate {
+            items.push(("camera-video-symbolic", "Video clip …", 1));
+        }
+        for (icon, label, what) in items {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            row.append(&gtk::Image::from_icon_name(icon));
+            row.append(&gtk::Label::new(Some(label)));
+            let b = gtk::Button::new();
+            b.set_child(Some(&row));
+            b.add_css_class("flat");
+            b.add_css_class("menurow");
+            let (w2, pop2) = (Rc::downgrade(&a), pop.clone());
+            b.connect_clicked(move |_| {
+                pop2.popdown();
+                let Some(a) = w2.upgrade() else { return };
+                if what == 0 {
+                    a.share_picture();
+                } else {
+                    a.clip_begin();
+                    a.toast("Play or slide the timeline to the clip's end");
+                }
+            });
+            list.append(&b);
+        }
+        pop.set_child(Some(&list));
+        btn.set_popover(Some(&pop));
+    });
+    let w = Rc::downgrade(a);
+    clip_x.connect_clicked(move |_| {
+        if let Some(a) = w.upgrade() {
+            a.clip_cancel();
+        }
+    });
+    let w = Rc::downgrade(a);
+    clip_go.connect_clicked(move |_| {
+        if let Some(a) = w.upgrade() {
+            a.clip_share();
+        }
+    });
+    let w = Rc::downgrade(a);
+    glib::spawn_future_local(async move {
+        while let Ok(d) = share_rx.recv().await {
+            let Some(a) = w.upgrade() else { return };
+            a.share_done(d);
         }
     });
     let w = Rc::downgrade(a);
@@ -1269,6 +1594,7 @@ fn build(app: &adw::Application) {
             t.present();
         }
         a.update_clock();
+        a.update_clip();
         // Scrub previews follow the finger: each camera fetches the picture at the current
         // spot as soon as its previous one has arrived (still() skips unchanged times).
         if a.mode.get() == Mode::Scrub || (a.mode.get() == Mode::Play && a.paused.get() && a.gap_hold.get()) {
