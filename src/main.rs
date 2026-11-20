@@ -11,6 +11,7 @@ mod rtsp;
 mod scan;
 mod share;
 mod frigate;
+mod fullview;
 mod stream;
 mod talk;
 mod timeline;
@@ -392,6 +393,7 @@ struct App {
     last_width: Cell<i32>,
     timeline: Timeline,
     time_label: gtk::Label,
+    full: Rc<fullview::FullView>,
     date_label: gtk::Label,
     live_btn: gtk::Button,
     play_btn: gtk::Button,
@@ -1056,6 +1058,7 @@ impl App {
         }
         self.clip_cancel();
         self.talk_stop();
+        self.full.leave(&self.window);
         self.focus.set(None);
         self.refresh_timeline();
         if self.mode.get() == Mode::Play {
@@ -1095,6 +1098,8 @@ window { background: #000; }
 .clipbar .go { border-radius: 999px; padding: 4px 16px; font-weight: 700; }
 .menurow { padding: 8px 18px; }
 .share-preview { border-radius: 10px; }
+.fsbtn { min-width: 48px; min-height: 48px; -gtk-icon-size: 22px; }
+.fsclock { font-feature-settings: "tnum"; }
 "#;
 
 fn build(app: &adw::Application) {
@@ -1201,6 +1206,11 @@ fn build(app: &adw::Application) {
     share_btn.set_icon_name("send-to-symbolic");
     share_btn.set_tooltip_text(Some("Share"));
     single_header.pack_end(&share_btn);
+    // Full screen: the picture over the whole screen, turnable to landscape.
+    let full_btn = gtk::Button::from_icon_name("view-fullscreen-symbolic");
+    full_btn.set_tooltip_text(Some("Full screen"));
+    single_header.pack_end(&full_btn);
+    let full = fullview::FullView::new();
     let clip_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     clip_bar.add_css_class("clipbar");
     let clip_x = gtk::Button::from_icon_name("window-close-symbolic");
@@ -1293,8 +1303,11 @@ fn build(app: &adw::Application) {
     content.append(&nav);
     content.append(&controls);
 
+    let top = gtk::Overlay::new();
+    top.set_child(Some(&content));
+    top.add_overlay(&full.root);
     let toasts = adw::ToastOverlay::new();
-    toasts.set_child(Some(&content));
+    toasts.set_child(Some(&top));
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Cameras")
@@ -1329,6 +1342,7 @@ fn build(app: &adw::Application) {
         last_width: Cell::new(0),
         timeline: timeline.clone(),
         time_label,
+        full: full.clone(),
         date_label,
         live_btn: live_btn.clone(),
         play_btn: play_btn.clone(),
@@ -1383,6 +1397,38 @@ fn build(app: &adw::Application) {
     });
     sw.add_controller(click);
 
+    // Full screen shows the same pictures as the single view.
+    let f = full.clone();
+    single.picture.connect_paintable_notify(move |p| {
+        if f.is_on() {
+            f.picture.set_paintable(p.paintable().as_ref());
+        }
+    });
+    let w = Rc::downgrade(a);
+    full_btn.connect_clicked(move |_| {
+        let Some(a) = w.upgrade() else { return };
+        let Some(c) = a.focus.get() else { return };
+        a.full.name.set_text(&a.cfg.cameras[c].name);
+        a.full.picture.set_paintable(a.single.picture.paintable().as_ref());
+        a.full.enter(&a.window);
+    });
+    let w = Rc::downgrade(a);
+    full.exit_btn.connect_clicked(move |_| {
+        if let Some(a) = w.upgrade() {
+            a.full.leave(&a.window);
+        }
+    });
+    let keys = gtk::EventControllerKey::new();
+    let w = Rc::downgrade(a);
+    keys.connect_key_pressed(move |_, k, _, _| {
+        let Some(a) = w.upgrade() else { return glib::Propagation::Proceed };
+        if a.full.is_on() && (k == gdk::Key::Escape || k == gdk::Key::BackSpace) {
+            a.full.leave(&a.window);
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    window.add_controller(keys);
     let w = Rc::downgrade(a);
     nav.connect_popped(move |_, _| {
         if let Some(a) = w.upgrade() {
@@ -1594,6 +1640,14 @@ fn build(app: &adw::Application) {
             t.present();
         }
         a.update_clock();
+        if a.full.is_on() {
+            let t = a.time_label.text();
+            let live = if a.mode.get() == Mode::Live { "LIVE · " } else { "" };
+            let s = format!("{live}{t}");
+            if a.full.clock.text() != s {
+                a.full.clock.set_text(&s);
+            }
+        }
         a.update_clip();
         // Scrub previews follow the finger: each camera fetches the picture at the current
         // spot as soon as its previous one has arrived (still() skips unchanged times).

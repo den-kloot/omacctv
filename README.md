@@ -39,6 +39,7 @@ The house number is pixelated and the basement is blurred for this README.*
   ("Last picture · 10:20").
 - **Single view:** pinch to zoom, one finger to pan, double tap for 2.5x and back. Speaker button
   to mute.
+- **Full screen:** the ⛶ button in the single view puts the camera over the whole screen, turned to landscape. Tap shows the buttons: turn (landscape the other way, then upright) and leave. Pinch to zoom, one finger to pan, double tap for 2.5x.
 - **Two-way audio:** a mic button for cameras with a speaker. Either straight from the phone to the
   camera over its ONVIF RTSP backchannel (G.711 mu-law), or through a small relay next to Frigate so
   that camera passwords never sit on the phone (see [Two-way audio](#two-way-audio)).
